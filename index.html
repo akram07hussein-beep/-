@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>إدارة العقارات والإيجارات</title>
+    <meta name="theme-color" content="#115e59" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="العقارات" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png" />
+    <link rel="apple-touch-icon" href="./icon-180.png" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+
+    <!-- Tailwind (يعمل مباشرة دون خطوة بناء للأنماط) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- بديل التخزين الدائم: يجعل window.storage يعمل على الجوال عبر localStorage
+         (نفس واجهة Claude، فلا حاجة لتعديل كود التطبيق) -->
+    <script>
+      (function () {
+        if (window.storage) return;
+        var P = function (v) { return Promise.resolve(v); };
+        window.storage = {
+          get: function (key) {
+            try { var v = localStorage.getItem(key); return P(v === null ? null : { key: key, value: v, shared: false }); }
+            catch (e) { return P(null); }
+          },
+          set: function (key, value) {
+            try { localStorage.setItem(key, value); return P({ key: key, value: value, shared: false }); }
+            catch (e) { return P(null); }
+          },
+          delete: function (key) {
+            try { localStorage.removeItem(key); return P({ key: key, deleted: true, shared: false }); }
+            catch (e) { return P(null); }
+          },
+          list: function (prefix) {
+            try {
+              var ks = [];
+              for (var i = 0; i < localStorage.length; i++) {
+                var k = localStorage.key(i);
+                if (!prefix || k.indexOf(prefix) === 0) ks.push(k);
+              }
+              return P({ keys: ks, prefix: prefix || "", shared: false });
+            } catch (e) { return P({ keys: [] }); }
+          }
+        };
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+
+    <!-- تسجيل عامل الخدمة ليعمل التطبيق دون إنترنت بعد أول فتح -->
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", function () {
+          navigator.serviceWorker.register("./sw.js").catch(function () {});
+        });
+      }
+    </script>
+  </body>
+</html>

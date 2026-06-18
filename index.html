@@ -13,8 +13,11 @@
     <link rel="apple-touch-icon" href="./icon-180.png" />
     <link rel="manifest" href="./manifest.webmanifest" />
 
+    <!-- Tailwind (يعمل مباشرة دون خطوة بناء للأنماط) -->
     <script src="https://cdn.tailwindcss.com"></script>
 
+    <!-- بديل التخزين الدائم: يجعل window.storage يعمل على الجوال عبر localStorage
+         (نفس واجهة Claude، فلا حاجة لتعديل كود التطبيق) -->
     <script>
       (function () {
         if (window.storage) return;
@@ -52,12 +55,9 @@
 
     <script>
       if ("serviceWorker" in navigator) {
-        navigator.serviceWorker.getRegistrations().then(function (rs) {
-          rs.forEach(function (r) { r.unregister(); });
+        window.addEventListener("load", function () {
+          navigator.serviceWorker.register("./sw.js").catch(function () {});
         });
-        if (window.caches) {
-          caches.keys().then(function (ks) { ks.forEach(function (k) { caches.delete(k); }); });
-        }
       }
     </script>
   </body>

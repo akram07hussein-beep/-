@@ -13,11 +13,8 @@
     <link rel="apple-touch-icon" href="./icon-180.png" />
     <link rel="manifest" href="./manifest.webmanifest" />
 
-    <!-- Tailwind (يعمل مباشرة دون خطوة بناء للأنماط) -->
     <script src="https://cdn.tailwindcss.com"></script>
 
-    <!-- بديل التخزين الدائم: يجعل window.storage يعمل على الجوال عبر localStorage
-         (نفس واجهة Claude، فلا حاجة لتعديل كود التطبيق) -->
     <script>
       (function () {
         if (window.storage) return;
@@ -53,12 +50,14 @@
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
 
-    <!-- تسجيل عامل الخدمة ليعمل التطبيق دون إنترنت بعد أول فتح -->
     <script>
       if ("serviceWorker" in navigator) {
-        window.addEventListener("load", function () {
-          navigator.serviceWorker.register("./sw.js").catch(function () {});
+        navigator.serviceWorker.getRegistrations().then(function (rs) {
+          rs.forEach(function (r) { r.unregister(); });
         });
+        if (window.caches) {
+          caches.keys().then(function (ks) { ks.forEach(function (k) { caches.delete(k); }); });
+        }
       }
     </script>
   </body>

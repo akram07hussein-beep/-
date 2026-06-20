@@ -228,12 +228,13 @@ function rangesOverlap(s1, e1, s2, e2) {
 function occupancyConflict(contracts, cand, excludeId) {
   return contracts.find((c) => {
     if (c.id === excludeId) return false;
+    if (c.status === "ended" && c.manualEnd) return false; // عقد أُنهي يدوياً لا يشغل الوحدة
     if (c.propertyId !== cand.propertyId) return false;
     const sameUnit = (c.unitId == null || cand.unitId == null) ? true : (c.unitId === cand.unitId);
     if (!sameUnit) return false;
     if (!rangesOverlap(cand.startDate, cand.endDate, c.startDate, c.endDate)) return false;
-    // يتعارض إذا كان العقد الآخر نشطاً (إشغال) أو لنفس المستأجر (تكرار)
-    return c.status === "active" || c.tenantId === cand.tenantId;
+    // يتعارض فقط عند تداخل المدد الزمنية فعلاً (إشغال مزدوج) أو تكرار لنفس المستأجر في نفس الفترة
+    return true;
   }) || null;
 }
 
@@ -725,10 +726,21 @@ function buildImagePdf(jpegB64, wpx, hpx) {
   return new Blob([bytes], { type: "application/pdf" });
 }
 
-async function shareCanvasDoc(canvas, fileBase, caption, ctx, phones, cc) {
+async function shareCanvasDoc(canvas, fileBase, caption, ctx, phones, cc, directToWa) {
   let pdfBlob = null;
   try { const jpeg = canvas.toDataURL("image/jpeg", 0.92); pdfBlob = buildImagePdf(jpeg.split(",")[1], canvas.width, canvas.height); } catch (e) {}
   const pdfFile = pdfBlob ? new File([pdfBlob], fileBase + ".pdf", { type: "application/pdf" }) : null;
+  // وضع الإرسال المباشر: نحفظ الملف ونفتح محادثة رقم المستأجر مباشرةً (دون لوحة المشاركة، لتفادي البحث بالاسم)
+  if (directToWa && phones && phones.length) {
+    const blob = pdfBlob || await canvasToBlob(canvas, "image/jpeg", 0.92);
+    const ext = pdfBlob ? "pdf" : "jpg";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = fileBase + "." + ext; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    try { window.open(waLink(phones[0], cc, caption), "_blank"); } catch (e) {}
+    ctx.toast && ctx.toast(`حُفظ ${ext.toUpperCase()} وفُتحت محادثة المستأجر — اضغط 📎 وأرفقه`);
+    return;
+  }
   // 1) مشاركة PDF مباشرة عبر لوحة المشاركة (تختار واتساب ثم جهة الاتصال)
   if (pdfFile) {
     try { if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) { await navigator.share({ files: [pdfFile], title: fileBase, text: caption }); return; } }
@@ -783,7 +795,7 @@ async function drawReceiptCanvas(payment, ctx) {
   if (st.key === "partial") rows.push(["المتبقي (نقص)", fmt(Math.abs(st.diff)) + " " + cur]);
   if (st.key === "surplus") rows.push(["الزيادة", fmt(st.diff) + " " + cur]);
   rows.push(["طريقة الدفع", payment.method || "—"]);
-  if (c && ctx.contractLedger) { const L = ctx.contractLedger(c); rows.push(["الرصيد الحالي", L.owed > 0.005 ? fmt(L.owed) + " " + cur + " (عليكم)" : L.credit > 0.005 ? fmt(L.credit) + " " + cur + " (لكم)" : "0 " + cur + " (مسوّى)", true]); }
+  if (c && (ctx.ledgerAsOfPayment || ctx.contractLedger)) { const L = ctx.ledgerAsOfPayment ? ctx.ledgerAsOfPayment(c, payment) : ctx.contractLedger(c); rows.push(["الرصيد وقت الإصدار", L.owed > 0.005 ? fmt(L.owed) + " " + cur + " (عليكم)" : L.credit > 0.005 ? fmt(L.credit) + " " + cur + " (لكم)" : "0 " + cur + " (مسوّى)", true]); }
 
   const W = 760, pad = 40, rowH = 40;
   const headerH = ctx.settings.logo ? 168 : 132, metaH = 46, stampH = 96, footerH = ctx.settings.ownerPhone ? 34 : 14;
@@ -848,7 +860,7 @@ async function shareReceiptFile(payment, ctx) {
     const canvas = await drawReceiptCanvas(payment, ctx);
     const c = ctx.contractById(payment.contractId);
     const phones = c ? ctx.tenantPhones(c.tenantId) : [];
-    await shareCanvasDoc(canvas, payment.receiptNo || "receipt", ctx.receiptText(payment), ctx, phones, ctx.settings.countryCode);
+    await shareCanvasDoc(canvas, payment.receiptNo || "receipt", ctx.receiptText(payment), ctx, phones, ctx.settings.countryCode, true);
   } catch (e) { ctx.toast && ctx.toast("تعذّر إنشاء الملف — استخدم زر الطباعة"); }
 }
 
@@ -978,7 +990,7 @@ async function drawStatementCanvas(data, settings) {
   return canvas;
 }
 async function shareStatementImage(data, text, phones, cc, ctx) {
-  try { ctx.toast && ctx.toast("جارٍ التحضير…"); const canvas = await drawStatementCanvas(data, ctx.settings); await shareCanvasDoc(canvas, "statement-" + data.tenant, text, ctx, phones, cc); }
+  try { ctx.toast && ctx.toast("جارٍ التحضير…"); const canvas = await drawStatementCanvas(data, ctx.settings); await shareCanvasDoc(canvas, "statement-" + data.tenant, text, ctx, phones, cc, true); }
   catch (e) { ctx.toast && ctx.toast("تعذّر إنشاء الكشف — استخدم زر الطباعة"); }
 }
 
@@ -1160,7 +1172,7 @@ function ReceiptView({ payment, ctx, onEdit, onClose }) {
           {st.key === "partial" && <Row k="المتبقي (نقص)" v={`${fmt(Math.abs(st.diff))} ${cur}`} />}
           {st.key === "surplus" && <Row k="الزيادة" v={`${fmt(st.diff)} ${cur}`} />}
           <Row k="طريقة الدفع" v={payment.method} />
-          {c && ctx.contractLedger && (() => { const L = ctx.contractLedger(c); const txt = L.owed > 0.005 ? `${fmt(L.owed)} ${cur} (عليكم)` : L.credit > 0.005 ? `${fmt(L.credit)} ${cur} (لكم)` : `0 ${cur} (مسوّى)`; return <Row k="الرصيد الحالي" v={txt} bold />; })()}
+          {c && (ctx.ledgerAsOfPayment || ctx.contractLedger) && (() => { const L = ctx.ledgerAsOfPayment ? ctx.ledgerAsOfPayment(c, payment) : ctx.contractLedger(c); const txt = L.owed > 0.005 ? `${fmt(L.owed)} ${cur} (عليكم)` : L.credit > 0.005 ? `${fmt(L.credit)} ${cur} (لكم)` : `0 ${cur} (مسوّى)`; return <Row k="الرصيد وقت الإصدار" v={txt} bold />; })()}
         </div>
         <div className="flex justify-center pb-5">
           <div className={`-rotate-6 border-4 rounded-xl px-5 py-1.5 font-extrabold text-lg tracking-wider ${stamp}`}>{st.label}</div>
@@ -1210,7 +1222,7 @@ function PlaceStatementView({ title, stmt, currency, text, logo, onCopy, onClose
             <div key={i} className="border border-stone-200 rounded-2xl p-3">
               <div className="flex justify-between items-center mb-1">
                 <div className="font-bold text-stone-800">{row.tenantName}</div>
-                <Pill className={row.status === "active" ? "bg-teal-100 text-teal-700" : "bg-stone-200 text-stone-600"}>{row.status === "active" ? "نشط" : "منتهٍ"}</Pill>
+                <Pill className={statusPillCls(row.status)}>{statusLabel(row.status)}</Pill>
               </div>
               <div className="text-xs text-stone-500 mb-2">{row.periodText} · {fmt(row.amount)} {currency}/{row.rentTypeLabel}</div>
               {row.payments.length > 0 && (
@@ -1291,7 +1303,7 @@ export default function App() {
     try {
       if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
       const t = todayISO(); let count = 0, total = 0;
-      data.contracts.filter((c) => c.status === "active").forEach((c) => {
+      data.contracts.filter((c) => liveStatus(c) === "active").forEach((c) => {
         const ps = data.payments.filter((p) => p.contractId === c.id);
         let billed = 0, received = 0;
         ps.forEach((p) => { billed += num(p.dueAmount) - num(p.discount) + num(p.fine); received += num(p.received); });
@@ -1325,6 +1337,21 @@ export default function App() {
   const tenantPhones = (id) => { const t = tenantById(id); if (!t) return []; if (Array.isArray(t.phones) && t.phones.length) return t.phones.filter(Boolean); return t.phone ? [t.phone] : []; };
   const propertyById = (id) => properties.find((p) => p.id === id);
   const contractById = (id) => contracts.find((c) => c.id === id);
+  /* الحالة الديناميكية للعقد محسوبة من التاريخ:
+     - "ended": إمّا أُنهي يدوياً (إنهاء مبكر) أو مضى تاريخ نهايته.
+     - "upcoming": لم يحن تاريخ بدايته بعد (غير نشط).
+     - "active": اليوم ضمن مدة العقد. */
+  const liveStatus = (c) => {
+    if (!c) return "ended";
+    if (c.status === "ended" && c.manualEnd) return "ended"; // إنهاء يدوي مبكر
+    const t = todayISO();
+    if (c.endDate && t > c.endDate) return "ended";          // مضى تاريخ النهاية
+    if (c.startDate && t < c.startDate) return "upcoming";   // لم يبدأ بعد
+    return "active";                                          // ضمن المدة
+  };
+  const isActiveNow = (c) => liveStatus(c) === "active";
+  const statusLabel = (s) => s === "active" ? "نشط" : s === "upcoming" ? "غير نشط" : "منتهٍ";
+  const statusPillCls = (s) => s === "active" ? "bg-teal-100 text-teal-700" : s === "upcoming" ? "bg-amber-100 text-amber-700" : "bg-stone-200 text-stone-600";
   const placeName = (c) => {
     const p = propertyById(c.propertyId); if (!p) return "—";
     const u = c.unitId ? (p.units || []).find((x) => x.id === c.unitId) : null;
@@ -1380,25 +1407,69 @@ export default function App() {
   };
   const nextPeriodIndex = (c) => coverChain(chainPeriods(c), chainEff(c)).count;
   const nextDue = (c) => { const ps = chainPeriods(c); return (ps[nextPeriodIndex(c)] || ps[ps.length - 1] || { due: todayISO() }).due; };
+  // حالة السلسلة: فترة قادمة ضمن المدة؟ أم يحتاج تجديداً؟ أم سينتقل لعقد قادم (نشط لاحقاً)؟
+  const chainStatus = (c) => {
+    const t = todayISO();
+    const chain = fullChain(c);
+    const chainIds = new Set(chain.map((x) => x.id));
+    const last = chain[chain.length - 1];
+    // ابحث عن عقد قادم (يبدأ مستقبلاً) لنفس المستأجر ونفس الوحدة — سواء مرتبط بالسلسلة أو مُنشأ يدوياً
+    const successor = contracts
+      .filter((x) => x.id !== c.id && x.tenantId === last?.tenantId && x.propertyId === last?.propertyId && (x.unitId || null) === (last?.unitId || null) && !(x.status === "ended" && x.manualEnd))
+      .filter((x) => x.startDate && x.startDate > t)                 // لم يبدأ بعد (سيُنشّط مستقبلاً)
+      .filter((x) => !c.startDate || x.startDate >= c.startDate)      // لاحق للعقد الحالي
+      .sort((a, b) => ((a.startDate || "") < (b.startDate || "") ? -1 : 1))[0] || null;
+    const willTransfer = !!successor;
+    // الفترات والتغطية ضمن مدة العقد الحالي فقط (لا نخلط بفترات عقد قادم لم يبدأ)
+    const ps = chainPeriods(c);
+    const idx = nextPeriodIndex(c);
+    const hasNext = idx < ps.length;
+    const ended = last && last.endDate && t > last.endDate;
+    // يحتاج تجديد: انتهت المدة (أو لها نهاية ولا فترة قادمة) ولا يوجد عقد قادم
+    const needsRenewal = !willTransfer && !hasNext && (ended || (last && last.endDate));
+    const next = hasNext ? ps[idx] : null;
+    return { hasNext, needsRenewal, ended, willTransfer, successor, nextDue: next ? next.due : null, nextPeriod: next };
+  };
   // الرصيد الجاري للسلسلة: balance<0 ⇒ عليكم ، balance>0 ⇒ لكم
   const contractLedger = (c) => {
     const t = todayISO();
     const periods = chainPeriods(c);
     const eff = chainEff(c);
     const received = chainReceived(c);
-    let chargesDue = 0, dueCount = 0;
-    periods.forEach((per) => { if (per.due <= t) { chargesDue += num(per.amount); dueCount++; } });
-    chargesDue = round2(chargesDue);
+    // الفترات المستحقة فقط حتى اليوم (لا تُحتسب فترات العقود القادمة التي لم يحن وقتها)
+    const duePeriods = periods.filter((per) => per.due <= t);
+    let chargesDue = 0; duePeriods.forEach((per) => { chargesDue += num(per.amount); });
+    chargesDue = round2(chargesDue); const dueCount = duePeriods.length;
     let fine = 0, discount = 0;
     chainPaymentsRaw(c).forEach((p) => { fine += num(p.fine); discount += num(p.discount); });
     const netAdj = round2(fine - discount);
-    const cov = coverChain(periods, eff);
-    const raw = (cov.count >= dueCount) ? cov.leftover : -round2(chargesDue - eff);
-    const balance = round2(raw - netAdj - chainOwedInit(c));
+    // التغطية تُحسب على الفترات المستحقة فقط؛ الفائض يبقى رصيداً للمستأجر
+    const cov = coverChain(duePeriods, eff);
+    const balance = round2(eff - chargesDue - netAdj - chainOwedInit(c));
     const billed = round2(chargesDue + netAdj);
     const unpaid = []; let lo = cov.leftover;
-    for (let i = cov.count; i < dueCount; i++) { let amt = num(periods[i].amount); if (lo > 0.005) { amt = round2(amt - lo); lo = 0; } if (amt > 0.005) unpaid.push({ ...periods[i], amount: amt }); }
+    for (let i = cov.count; i < dueCount; i++) { let amt = num(duePeriods[i].amount); if (lo > 0.005) { amt = round2(amt - lo); lo = 0; } if (amt > 0.005) unpaid.push({ ...duePeriods[i], amount: amt }); }
     return { balance, owed: Math.max(0, -balance), credit: Math.max(0, balance), unpaid, billed, received, carry: round2(num(fullChain(c)[0]?.openingBalance) || 0), coveredCount: cov.count, leftover: cov.leftover, dueCount };
+  };
+  // رصيد السلسلة كما كان وقت إصدار إيصال معيّن (لا يتغيّر لاحقاً)
+  const ledgerAsOfPayment = (c, payment) => {
+    const asOf = payment?.paymentDate || todayISO();
+    const periods = chainPeriods(c);
+    // المدفوعات حتى هذا الإيصال (شاملاً إيّاه)
+    const allPays = chainPaymentsRaw(c);
+    const upto = [];
+    for (const p of allPays) { upto.push(p); if (p.id === payment?.id) break; }
+    const credit0 = chainCredit(c);
+    const received = round2(upto.reduce((s, p) => s + num(p.received), 0));
+    const eff = round2(received + credit0);
+    // الفترات المستحقة حتى تاريخ الإيصال فقط (لا فترات العقود القادمة)
+    let chargesDue = 0; periods.forEach((per) => { if (per.due <= asOf) chargesDue += num(per.amount); });
+    chargesDue = round2(chargesDue);
+    let fine = 0, discount = 0;
+    upto.forEach((p) => { fine += num(p.fine); discount += num(p.discount); });
+    const netAdj = round2(fine - discount);
+    const balance = round2(eff - chargesDue - netAdj - chainOwedInit(c));
+    return { balance, owed: Math.max(0, -balance), credit: Math.max(0, balance) };
   };
   // توزيع كل مدفوعات السلسلة على فتراتها (الأقدم فالأقدم) مع حالة كل فترة ورقم الإيصال والعقد
   const periodAllocation = (c) => {
@@ -1496,7 +1567,7 @@ export default function App() {
     if (st.key === "surplus") lines.push(`زيادة: ${fmt(st.diff)} ${cur}`);
     lines.push(`الحالة: ${st.label}`);
     lines.push(`طريقة الدفع: ${p.method}`);
-    if (c) { const L = contractLedger(c); if (L.owed > 0.005) lines.push(`الرصيد الحالي: ${fmt(L.owed)} ${cur} (عليكم)`); else if (L.credit > 0.005) lines.push(`الرصيد الحالي: ${fmt(L.credit)} ${cur} (لكم)`); else lines.push(`الرصيد الحالي: 0 ${cur} (الحساب مسوّى)`); }
+    if (c) { const L = ledgerAsOfPayment(c, p); if (L.owed > 0.005) lines.push(`الرصيد وقت الإصدار: ${fmt(L.owed)} ${cur} (عليكم)`); else if (L.credit > 0.005) lines.push(`الرصيد وقت الإصدار: ${fmt(L.credit)} ${cur} (لكم)`); else lines.push(`الرصيد وقت الإصدار: 0 ${cur} (الحساب مسوّى)`); }
     if (settings.ownerPhone) lines.push(`للتواصل: ${settings.ownerPhone}`);
     lines.push(`شكراً لكم.`);
     return lines.join("\n");
@@ -1504,868 +1575,15 @@ export default function App() {
   function reminderText(c) {
     const cur = settings.currency; const t = todayISO();
     const L = contractLedger(c);
+    const cs = chainStatus(c);
     const name = tenantName(c.tenantId);
     const place = placeName(c);
     const extra = round2(L.owed - L.unpaid.reduce((s, p) => s + num(p.amount), 0)); // نقص مرحّل من دفعات سابقة
     if (L.owed <= 0.005) {
-      const ps = periodSchedule(c, nextPeriodIndex(c));
       const lines = [`الأخ / ${name}`, `بخصوص إيجار ${place}`];
       if (L.credit > 0.005) lines.push(`رصيدكم الحالي: ${fmt(L.credit)} ${cur} (لكم).`);
-      lines.push(`تذكير ودّي بقرب موعد السداد.`, `${ps.label}: ${fmt(ps.amount)} ${cur} — تاريخ الاستحقاق ${ps.due}.`, `نشكر لكم التزامكم.`);
-      return lines.join("\n");
-    }
-    const lateCount = L.unpaid.filter((p) => p.end < t).length;
-    const dueCount = paymentsOf(c.id).length + L.unpaid.length;
-    if (lateCount >= 3) {
-      const lines = [`الأخ / ${name}`, `بخصوص إيجار (${place})`, ``, `فيما يلي تفصيل المبالغ المستحقة:`];
-      L.unpaid.forEach((p) => lines.push(`• ${p.label}: ${fmt(p.amount)} ${cur}`));
-      if (extra > 0.005) lines.push(`• نقص من دفعات سابقة: ${fmt(extra)} ${cur}`);
-      lines.push(``, `الإجمالي المستحق: ${fmt(L.billed)} ${cur} (${dueCount} فترة).`, `إجمالي المسدّد: ${fmt(L.received)} ${cur}`, `الرصيد المتبقي عليكم: ${fmt(L.owed)} ${cur}`, ``);
-      lines.push(`نلفت كريم عنايتكم إلى أن المتأخرات تجاوزت ${monthWord(dueCount)}، ونأمل المبادرة بالسداد العاجل تفادياً للإحراج ومطالبتكم بإخلاء (${place}) واتخاذ الإجراءات النظامية والقانونية. نأمل حسن تعاونكم وحسن تفهّمكم والمبادرة بالسداد سريعاً.`);
-      return lines.join("\n");
-    }
-    const lines = [`الأخ / ${name}`, `بخصوص إيجار ${place}`, `إليكم ملخّص الحساب حتى ${t}:`];
-    L.unpaid.forEach((p) => lines.push(`• ${p.label}: ${fmt(p.amount)} ${cur}`));
-    if (extra > 0.005) lines.push(`• نقص من دفعات سابقة: ${fmt(extra)} ${cur}`);
-    lines.push(``, `إجمالي المستحق: ${fmt(L.billed)} ${cur}`, `إجمالي المسدّد: ${fmt(L.received)} ${cur}`, `الرصيد المتبقي عليكم: ${fmt(L.owed)} ${cur}`, ``, `نرجو منكم سداد المبلغ المستحق في أقرب وقت آملين حسن تعاونكم وحسن تفهّمكم والمبادرة بالسداد سريعاً.`);
-    return lines.join("\n");
-  }
-  function expiryText(c) {
-    return [
-      `عزيزي/عزيزتي ${tenantName(c.tenantId)}،`,
-      `نفيدكم بقرب انتهاء عقد إيجار ${placeName(c)} بتاريخ ${c.endDate}.`,
-      `يرجى التواصل لتجديد العقد أو ترتيب الإخلاء. وشكراً.`,
-      settings.org ? `\n${settings.org}` : "",
-    ].filter(Boolean).join("\n");
-  }
-  function expiryMsgVacate(c) {
-    return [
-      `الأخ/ ${tenantName(c.tenantId)}`,
-      `نفيدكم بقرب انتهاء عقد إيجار (${placeName(c)}) بتاريخ ${c.endDate}.`,
-      `نرجو إخلاء (${placeName(c)}) قبل انتهاء مدة العقد، وفي حال تجاوز مدة انتهاء العقد دون إخلاء سيتم المطالبة بالإخلاء فوراً وستُحاسبون بغرامة خاصة عن كل يوم تأخير وسيتم اتخاذ كافة الإجراءات القانونية والتنظيمية ضدكم.`,
-      `نرجو منكم حسن التعاون وعدم الإحراج وشكراً.`,
-      settings.org ? `\n${settings.org}` : "",
-    ].filter(Boolean).join("\n");
-  }
-  function expiryMsgReprice(c, newPrice) {
-    const cur = settings.currency;
-    return [
-      `الأخ/ ${tenantName(c.tenantId)}`,
-      `نفيدكم بقرب انتهاء عقد إيجار (${placeName(c)}) بتاريخ ${c.endDate}.`,
-      `لتجديد العقد سيتم تعديل السعر إلى (${fmt(newPrice)} ${cur} / ${rentLabel(c.rentType)}).`,
-      `في حال الموافقة على قبول التعديل نرجو إرسال رسالة تفيد بذلك لإصدار عقد جديد.`,
-      `وفي حال عدم القبول نرجو منكم إخلاء (${placeName(c)}) قبل تاريخ انتهاء العقد، وفي حال تجاوز مدة انتهاء العقد دون إخلاء أو رد سيتم المطالبة بالإخلاء فوراً وستُحاسبون بغرامة خاصة عن كل يوم تأخير وسيتم اتخاذ كافة الإجراءات القانونية والتنظيمية ضدكم.`,
-      ``,
-      `نرجو منكم حسن التعاون وعدم الإحراج وشكراً.`,
-      settings.org ? `\n${settings.org}` : "",
-    ].filter(Boolean).join("\n");
-  }
-  function expiryMsgNotes(c, notes) {
-    return [
-      `الأخ/ ${tenantName(c.tenantId)}`,
-      `نفيدكم بقرب انتهاء عقد إيجار (${placeName(c)}) بتاريخ ${c.endDate}.`,
-      (notes || "").trim(),
-      `نرجو منكم حسن التعاون وشكراً.`,
-      settings.org ? `\n${settings.org}` : "",
-    ].filter(Boolean).join("\n");
-  }
-  function statementFor(tenantId) {
-    const cs = contracts.filter((c) => c.tenantId === tenantId);
-    const tx = payments.filter((p) => cs.some((c) => c.id === p.contractId)).sort((a, b) => a.paymentDate < b.paymentDate ? -1 : 1);
-    let charged = 0, disc = 0, fine = 0, received = 0;
-    tx.forEach((p) => { charged += num(p.dueAmount) - num(p.discount) + num(p.fine); disc += num(p.discount); fine += num(p.fine); received += num(p.received); });
-    return { tx, charged, disc, fine, received, balance: charged - received, contracts: cs };
-  }
-  function statementText(tenantId) {
-    const cur = settings.currency;
-    const cs = contracts.filter((c) => c.tenantId === tenantId);
-    // تمثيل كل سلسلة بأحدث عقد فيها (لتفادي التكرار)
-    const reps = []; const seenRoot = new Set();
-    cs.forEach((c) => { const chain = fullChain(c); const root = chain[0]; if (!seenRoot.has(root.id)) { seenRoot.add(root.id); reps.push(chain[chain.length - 1]); } });
-    reps.sort((a, b) => ((a.startDate || "") < (b.startDate || "") ? -1 : 1));
-    const lines = [`*كشف حساب*`, `المستأجر: ${tenantName(tenantId)}`, `حتى تاريخ: ${todayISO()}`];
-    const stW = { paid: "مسدّد", partial: "جزئي", unpaid: "غير مسدّد", future: "لم يحن استحقاقها" };
-    let gBilled = 0, gReceived = 0, gOwed = 0, gCredit = 0;
-    reps.forEach((c) => {
-      const chain = fullChain(c); const L = contractLedger(c); const alloc = periodAllocation(c);
-      gBilled += L.billed; gReceived += L.received; gOwed += L.owed; gCredit += L.credit;
-      const nums = chain.map((x) => x.contractNo || "—").join(" ← ");
-      const root = chain[0]; const last = chain[chain.length - 1];
-      lines.push(``, `▣ ${placeName(c)} — عقود ${nums}`);
-      lines.push(`من ${root.startDate || "—"}${last.endDate ? " إلى " + last.endDate : ""}`);
-      lines.push(`حالة السداد (الأقدم أولاً):`);
-      alloc.forEach((r) => lines.push(`• ${r.label}${r.contractNo && r.contractNo !== last.contractNo ? ` [عقد ${r.contractNo}]` : ""}: ${stW[r.status]}${r.status === "partial" ? ` (سُدّد ${fmt(r.paidAmt)})` : ""}${r.receipts.length ? ` — ${r.receipts.join("، ")}` : ""}`));
-      lines.push(`إجمالي المستحق حتى اليوم: ${fmt(L.billed)} ${cur}`);
-      lines.push(`إجمالي المسدّد: ${fmt(L.received)} ${cur}`);
-      lines.push(`الرصيد: ${L.owed > 0.005 ? fmt(L.owed) + " " + cur + " (عليكم)" : L.credit > 0.005 ? fmt(L.credit) + " " + cur + " (لكم)" : "0 " + cur + " (مسوّى)"}`);
-    });
-    if (reps.length === 0) lines.push(``, `لا توجد عقود.`);
-    if (reps.length > 1) {
-      const net = round2(gCredit - gOwed);
-      lines.push(``, `════════════`, `*الإجمالي العام:*`);
-      lines.push(`إجمالي المستحق: ${fmt(gBilled)} ${cur}`);
-      lines.push(`إجمالي المسدّد: ${fmt(gReceived)} ${cur}`);
-      lines.push(`الرصيد الكلي: ${net < -0.005 ? fmt(-net) + " " + cur + " (عليكم)" : net > 0.005 ? fmt(net) + " " + cur + " (لكم)" : "0 " + cur + " (مسوّى)"}`);
-    }
-    if (settings.org) lines.push(``, settings.org);
-    return lines.join("\n");
-  }
-  function statementStruct(tenantId) {
-    const cur = settings.currency;
-    const cs = contracts.filter((c) => c.tenantId === tenantId);
-    const reps = []; const seen = new Set();
-    cs.forEach((c) => { const chain = fullChain(c); const root = chain[0]; if (!seen.has(root.id)) { seen.add(root.id); reps.push(chain[chain.length - 1]); } });
-    reps.sort((a, b) => ((a.startDate || "") < (b.startDate || "") ? -1 : 1));
-    const blocks = []; let gB = 0, gR = 0, gO = 0, gC = 0;
-    reps.forEach((c) => {
-      const chain = fullChain(c), L = contractLedger(c), alloc = periodAllocation(c);
-      const root = chain[0], last = chain[chain.length - 1];
-      gB += L.billed; gR += L.received; gO += L.owed; gC += L.credit;
-      blocks.push({ t: "h2", text: `${placeName(c)} — ${chain.map((x) => x.contractNo || "—").join(" ← ")}` });
-      blocks.push({ t: "sub", text: `من ${root.startDate || "—"}${last.endDate ? " إلى " + last.endDate : ""}` });
-      alloc.forEach((r) => blocks.push({ t: "row", status: r.status, text: `${r.label}${r.contractNo && r.contractNo !== last.contractNo ? ` [${r.contractNo}]` : ""}` }));
-      blocks.push({ t: "total", text: `المستحق ${fmt(L.billed)} · المسدّد ${fmt(L.received)}` });
-      blocks.push({ t: "bal", status: L.owed > 0.005 ? "unpaid" : "paid", text: L.owed > 0.005 ? `الرصيد: ${fmt(L.owed)} ${cur} (عليكم)` : L.credit > 0.005 ? `الرصيد: ${fmt(L.credit)} ${cur} (لكم)` : `الرصيد: مسوّى` });
-      blocks.push({ t: "space" });
-    });
-    let grand = null;
-    if (reps.length > 1) { const net = round2(gC - gO); grand = { billed: gB, received: gR, balanceText: net < -0.005 ? `الرصيد الكلي: ${fmt(-net)} ${cur} (عليكم)` : net > 0.005 ? `الرصيد الكلي: ${fmt(net)} ${cur} (لكم)` : `الرصيد الكلي: مسوّى`, color: net < -0.005 ? "#e11d48" : net > 0.005 ? "#0284c7" : "#059669" }; }
-    return { tenant: tenantName(tenantId), date: todayISO(), blocks, grand };
-  }
-
-  function statementForPlace(propertyId, unitId) {
-    const cs = contracts
-      .filter((c) => c.propertyId === propertyId && (unitId == null ? true : c.unitId === unitId))
-      .sort((a, b) => ((a.startDate || "") < (b.startDate || "") ? 1 : -1)); // الأحدث أولاً
-    let totalCharged = 0, totalReceived = 0;
-    const rows = cs.map((c) => {
-      const ps = payments.filter((p) => p.contractId === c.id).sort((a, b) => a.paymentDate < b.paymentDate ? -1 : 1);
-      let charged = 0, received = 0;
-      ps.forEach((p) => { charged += num(p.dueAmount) - num(p.discount) + num(p.fine); received += num(p.received); });
-      totalCharged += charged; totalReceived += received;
-      return {
-        tenantName: tenantName(c.tenantId), status: c.status, amount: c.amount, rentTypeLabel: rentLabel(c.rentType),
-        periodText: `من ${c.startDate || "—"} ${c.status === "active" ? "— الآن" : c.endDate ? "إلى " + c.endDate : "(منتهٍ)"}`,
-        payments: ps, charged, received, balance: charged - received,
-      };
-    });
-    return { contracts: rows, totalCharged, totalReceived, balance: totalCharged - totalReceived };
-  }
-  function placeStatementText(propertyId, unitId, title) {
-    const s = statementForPlace(propertyId, unitId); const cur = settings.currency;
-    const lines = [`*${title}*`, `حتى تاريخ: ${todayISO()}`, ``];
-    s.contracts.forEach((r) => {
-      lines.push(`■ ${r.tenantName} (${r.status === "active" ? "نشط" : "منتهٍ"}) — ${fmt(r.amount)} ${cur}/${r.rentTypeLabel}`);
-      r.payments.forEach((p) => lines.push(`   ${p.paymentDate} | ${p.receiptNo} | ${fmt(p.received)} ${cur}`));
-      lines.push(`   مستحق ${fmt(r.charged)} | محصّل ${fmt(r.received)} | متبقٍ ${fmt(r.balance)} ${cur}`, ``);
-    });
-    lines.push(`الإجمالي — مستحق ${fmt(s.totalCharged)} | محصّل ${fmt(s.totalReceived)} | متبقٍ ${fmt(s.balance)} ${cur}`);
-    if (settings.org) lines.push(``, settings.org);
-    return lines.join("\n");
-  }
-
-  const ctx = { settings, tenantName, tenantPhone, placeName, contractById, receiptText, reminderText, statementText, copy };
-
-  /* ----- معالجات البيانات ----- */
-  const saveProperty = (p) => update((d) => { if (p.id) { const i = d.properties.findIndex((x) => x.id === p.id); d.properties[i] = { ...d.properties[i], ...p }; } else d.properties.push({ ...p, id: uid(), units: [] }); });
-  const saveUnit = (propId, u) => update((d) => { const pr = d.properties.find((x) => x.id === propId); pr.units = pr.units || []; const i = pr.units.findIndex((x) => x.id === u.id); if (i >= 0) pr.units[i] = u; else pr.units.push(u); });
-  const delUnit = (propId, uId) => update((d) => { const pr = d.properties.find((x) => x.id === propId); pr.units = (pr.units || []).filter((x) => x.id !== uId); });
-  const delProperty = (id) => update((d) => { d.properties = d.properties.filter((x) => x.id !== id); });
-  const saveTenant = (t) => update((d) => { if (t.id) { const i = d.tenants.findIndex((x) => x.id === t.id); d.tenants[i] = { ...d.tenants[i], ...t }; } else d.tenants.push({ ...t, id: uid() }); });
-  const delTenant = (id) => update((d) => { d.tenants = d.tenants.filter((x) => x.id !== id); });
-  const saveContract = (c) => update((d) => {
-    const i = d.contracts.findIndex((x) => x.id === c.id);
-    if (i >= 0) { d.contracts[i] = c; return; }
-    if (!c.contractNo) { c.contractNo = "C-" + String(d.counters.contract || 1).padStart(4, "0"); d.counters.contract = (d.counters.contract || 1) + 1; }
-    d.contracts.push(c);
-  });
-  const handleSaveContract = (c) => {
-    const conflict = occupancyConflict(contracts, c, c.id);
-    if (conflict) {
-      showToast(`يتعارض زمنياً مع عقد ${conflict.contractNo || ""} لـ«${tenantName(conflict.tenantId)}» على نفس الوحدة — غيّر التواريخ أو الوحدة.`);
-      return;
-    }
-    saveContract(c); setModal(null);
-  };
-  const handleRenew = (old, nd) => {
-    const carried = round2(contractLedger(old).balance);
-    const nc = { id: uid(), propertyId: old.propertyId, unitId: old.unitId, tenantId: old.tenantId, rentType: nd.rentType, amount: num(nd.amount), startDate: nd.startDate, endDate: nd.endDate || null, deposit: num(nd.deposit), note: nd.note || "", status: "active", prevContractId: old.id };
-    const doRenew = () => {
-      update((d) => {
-        const o = d.contracts.find((x) => x.id === old.id); if (o) o.status = "ended";
-        nc.contractNo = "C-" + String(d.counters.contract || 1).padStart(4, "0"); d.counters.contract = (d.counters.contract || 1) + 1;
-        d.contracts.push(nc);
-      });
-      setModal({ type: "renewal", payload: { c: nc, old, carried } });
-    };
-    const conflict = occupancyConflict(contracts.filter((x) => x.id !== old.id), nc, nc.id);
-    if (conflict) askConfirm(`تنبيه: العقد الجديد يتداخل زمنياً مع عقد ${conflict.contractNo || ""} لـ«${tenantName(conflict.tenantId)}». الأفضل ضبط تاريخ البداية بعد نهاية العقد السابق. هل تريد المتابعة؟`, doRenew);
-    else doRenew();
-  };
-  const restoreContract = (id) => {
-    const c = contracts.find((x) => x.id === id);
-    if (!c) return;
-    if (c.endDate && c.endDate < todayISO()) { showToast("انتهت مدة العقد — استخدم التجديد بدل الاستعادة"); return; }
-    const conflict = occupancyConflict(contracts, { ...c, status: "active" }, id);
-    if (conflict) { showToast(`يتعارض مع عقد نشط ${conflict.contractNo || ""} لـ«${tenantName(conflict.tenantId)}»`); return; }
-    update((d) => { const x = d.contracts.find((y) => y.id === id); if (x) x.status = "active"; });
-    showToast("تمت استعادة العقد");
-  };
-  const deleteContract = (id) => {
-    update((d) => {
-      d.contracts = d.contracts.filter((x) => x.id !== id);
-      d.payments = d.payments.filter((p) => p.contractId !== id);
-      d.contracts.forEach((x) => { if (x.prevContractId === id) x.prevContractId = null; });
-    });
-    showToast("تم حذف العقد ومدفوعاته");
-  };
-  const endContract = (id) => update((d) => { const c = d.contracts.find((x) => x.id === id); if (c) c.status = "ended"; });
-  const handleTransfer = (oldContract, payload) => {
-    const doIt = () => update((d) => {
-      const old = d.contracts.find((x) => x.id === oldContract.id);
-      if (old) { old.status = "ended"; old.endDate = payload.transferDate; }
-      const nc = { id: uid(), propertyId: payload.propertyId, unitId: payload.unitId, tenantId: oldContract.tenantId, rentType: payload.rentType, amount: payload.amount, startDate: payload.transferDate, endDate: null, deposit: payload.deposit, note: payload.note, status: "active" };
-      nc.contractNo = "C-" + String(d.counters.contract || 1).padStart(4, "0"); d.counters.contract = (d.counters.contract || 1) + 1;
-      d.contracts.push(nc);
-    });
-    const conflict = occupancyConflict(contracts, { propertyId: payload.propertyId, unitId: payload.unitId || null, tenantId: oldContract.tenantId, startDate: payload.transferDate, endDate: null }, oldContract.id);
-    if (conflict) {
-      askConfirm(`${placeName({ propertyId: payload.propertyId, unitId: payload.unitId })} مشغول بعقد نشط للمستأجر «${tenantName(conflict.tenantId)}». هل تريد المتابعة بالنقل؟`, () => { doIt(); setModal(null); });
-    } else { doIt(); setModal(null); }
-  };
-  const delContract = (id) => update((d) => { d.contracts = d.contracts.filter((x) => x.id !== id); d.payments = d.payments.filter((x) => x.contractId !== id); });
-  const savePayment = (p) => {
-    if (p.receiptNo) { // تعديل دفعة قائمة
-      update((d) => { const i = d.payments.findIndex((x) => x.id === p.id); if (i >= 0) d.payments[i] = p; });
-      setTimeout(() => setModal({ type: "receipt", payload: p }), 0);
-      return;
-    }
-    const no = settings.receiptPrefix + String(data.counters.receipt).padStart(4, "0");
-    const created = { ...p, receiptNo: no };
-    update((d) => { d.counters.receipt += 1; d.payments.push(created); });
-    setTimeout(() => setModal({ type: "receipt", payload: created }), 0);
-  };
-  const delPayment = (id) => update((d) => { d.payments = d.payments.filter((x) => x.id !== id); });
-  const saveExpense = (e) => update((d) => { d.expenses.push(e); });
-  const delExpense = (id) => update((d) => { d.expenses = d.expenses.filter((x) => x.id !== id); });
-  const saveSettings = (s) => update((d) => { d.settings = s; });
-
-  const askConfirm = (message, onYes) => setConfirmBox({ message, onYes });
-
-  /* ----- لوحة المؤشرات ----- */
-  const active = contracts.filter((c) => c.status === "active");
-  const rentableUnits = properties.reduce((s, p) => s + Math.max(1, (p.units || []).length), 0);
-  const occupied = active.length;
-  const expectedMonthly = active.reduce((s, c) => s + monthlyEquivalent(c), 0);
-  const thisMonth = todayISO().slice(0, 7);
-  const collectedThisMonth = payments.filter((p) => (p.paymentDate || "").slice(0, 7) === thisMonth).reduce((s, p) => s + num(p.received), 0);
-  const overdueData = active.map((c) => ({ c, L: contractLedger(c) })).filter((x) => x.L.owed > 0.005)
-    .sort((a, b) => b.L.owed - a.L.owed);
-  const overdueTotal = overdueData.reduce((s, x) => s + x.L.owed, 0);
-  const dueSoonList = active.filter((c) => { const n = nextDue(c); return n >= todayISO() && n <= addDays(todayISO(), 7); });
-  const expiryWindow = num(settings.expiryAlertDays) || 30;
-  const expiringList = active
-    .filter((c) => c.endDate && daysBetween(todayISO(), c.endDate) <= expiryWindow)
-    .sort((a, b) => (a.endDate < b.endDate ? -1 : 1));
-
-  /* =========================== الشاشات =========================== */
-  function Home() {
-    return (
-      <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
-          <Stat label="العقارات" value={properties.length} sub={`${rentableUnits} وحدة قابلة للتأجير`} />
-          <Stat label="نسبة الإشغال" value={`${rentableUnits ? Math.round((occupied / rentableUnits) * 100) : 0}%`} sub={`${occupied} مؤجّر`} color="text-teal-700" />
-          <Stat label="الإيراد المتوقع/شهر" value={`${fmt(expectedMonthly)}`} sub={settings.currency} color="text-teal-700" />
-          <Stat label="المُحصّل هذا الشهر" value={`${fmt(collectedThisMonth)}`} sub={settings.currency} color="text-emerald-600" />
-        </div>
-
-        {overdueData.length > 0 && (
-          <div className="bg-rose-600 text-white rounded-2xl p-4 shadow-sm">
-            <div className="text-sm font-bold opacity-90">تذكير المتأخرات</div>
-            <div className="text-2xl font-extrabold mt-0.5">{fmt(overdueTotal)} {settings.currency}</div>
-            <div className="text-sm opacity-90 mt-0.5">{overdueData.length} مستأجر متأخر عن السداد</div>
-          </div>
-        )}
-
-        <SectionTitle title="متأخرات السداد" badge={overdueData.length} badgeColor="bg-rose-100 text-rose-700" />
-        {overdueData.length === 0 ? <p className="text-sm text-stone-400 px-1">لا توجد متأخرات. 👍</p> : overdueData.map((x) => <OverdueCard key={x.c.id} c={x.c} L={x.L} />)}
-
-        <SectionTitle title="تستحق خلال 7 أيام" badge={dueSoonList.length} badgeColor="bg-amber-100 text-amber-700" />
-        {dueSoonList.length === 0 ? <p className="text-sm text-stone-400 px-1">لا شيء قريب.</p> : dueSoonList.map((c) => <DueCard key={c.id} c={c} />)}
-
-        <SectionTitle title={`عقود تنتهي خلال ${expiryWindow} يوماً`} badge={expiringList.length} badgeColor="bg-orange-100 text-orange-700" />
-        {expiringList.length === 0 ? <p className="text-sm text-stone-400 px-1">لا توجد عقود قاربت على الانتهاء.</p> : expiringList.map((c) => <ExpiryCard key={c.id} c={c} />)}
-      </div>
-    );
-  }
-
-  function OverdueCard({ c, L }) {
-    const cur = settings.currency;
-    const extra = round2(L.owed - L.unpaid.reduce((s, p) => s + num(p.amount), 0)); // نقص من دفعات سابقة
-    return (
-      <div className="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="font-bold text-stone-800 truncate">{tenantName(c.tenantId)}</div>
-            <div className="text-xs text-stone-500 truncate">{placeName(c)}</div>
-          </div>
-          <Pill className="bg-rose-100 text-rose-700">عليه {fmt(L.owed)} {cur}</Pill>
-        </div>
-        <div className="mt-2 text-xs text-stone-500 space-y-0.5">
-          {L.unpaid.slice(0, 4).map((p, i) => <div key={i}>• {p.label} — {fmt(p.amount)} {cur}</div>)}
-          {L.unpaid.length > 4 && <div>وغيرها…</div>}
-          {extra > 0.005 && <div className="text-amber-700 font-bold">• نقص من دفعات سابقة — {fmt(extra)} {cur}</div>}
-        </div>
-        <div className="flex flex-wrap gap-2 mt-3">
-          <WaButtons phones={tenantPhones(c.tenantId)} cc={settings.countryCode} text={reminderText(c)} label="تذكير المستأجر" />
-          <Btn onClick={() => openPayment(c)} className="px-3 py-2">تسجيل دفعة</Btn>
-        </div>
-      </div>
-    );
-  }
-
-  function ExpiryCard({ c }) {
-    const left = daysBetween(todayISO(), c.endDate);
-    const badge = left < 0
-      ? { txt: `منتهٍ منذ ${Math.abs(left)} يوم`, cls: "bg-rose-100 text-rose-700" }
-      : left === 0
-        ? { txt: "ينتهي اليوم", cls: "bg-rose-100 text-rose-700" }
-        : left <= 7
-          ? { txt: `باقٍ ${left} يوم`, cls: "bg-rose-100 text-rose-700" }
-          : { txt: `باقٍ ${left} يوم`, cls: "bg-amber-100 text-amber-700" };
-    return (
-      <div className="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="font-bold text-stone-800 truncate">{tenantName(c.tenantId)}</div>
-            <div className="text-xs text-stone-500 truncate">{placeName(c)} · ينتهي {c.endDate}</div>
-          </div>
-          <Pill className={badge.cls}>{badge.txt}</Pill>
-        </div>
-        <div className="flex flex-wrap gap-2 mt-3">
-          <Btn className="px-3 py-2" onClick={() => setModal({ type: "renew", payload: c })}>تجديد / تمديد</Btn>
-          <Btn kind="gold" className="px-3 py-2" onClick={() => setModal({ type: "expiry-action", payload: c })}>تنبيه المستأجر</Btn>
-          <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "transfer", payload: c })}>نقل</Btn>
-        </div>
-      </div>
-    );
-  }
-
-  function DueCard({ c, late }) {
-    return (
-      <div className="bg-white rounded-2xl border border-stone-100 shadow-sm p-4 flex items-center justify-between gap-2">
-        <div className="min-w-0">
-          <div className="font-bold text-stone-800 truncate">{tenantName(c.tenantId)}</div>
-          <div className="text-xs text-stone-500 truncate">{placeName(c)} · استحقاق {nextDue(c)}</div>
-        </div>
-        <div className="flex gap-1.5 shrink-0">
-          <WaButtons phones={tenantPhones(c.tenantId)} cc={settings.countryCode} text={reminderText(c)} label="تذكير" />
-          <Btn onClick={() => openPayment(c)} className="px-3 py-2">دفعة</Btn>
-        </div>
-      </div>
-    );
-  }
-
-  function openPayment(c) {
-    const periods = chainPeriods(c);
-    const idx = nextPeriodIndex(c);
-    const ps = periods[idx] || periods[periods.length - 1] || periodSchedule(c, 0);
-    const L = contractLedger(c);
-    const nextRent = num(ps.amount);
-    const defReceived = L.balance > 0.005 ? round2(Math.max(0, nextRent - L.credit)) : L.balance < -0.005 ? L.owed : nextRent;
-    setModal({ type: "payment", payload: { contract: c, suggestion: { index: idx, label: ps.label, due: ps.due, amount: ps.amount, prorated: ps.prorated, days: ps.days, priorBalance: L.balance, existingReceived: chainEff(c), defaultReceived: defReceived, periods } } });
-  }
-  function openEditPayment(p) {
-    const c = contractById(p.contractId);
-    if (!c) { showToast("العقد غير موجود"); return; }
-    const periods = chainPeriods(c);
-    const pays = chainPaymentsRaw(c);
-    let existingReceived = chainCredit(c);
-    for (const x of pays) { if (x.id === p.id) break; existingReceived += num(x.received); }
-    const idx = coverChain(periods, existingReceived).count;
-    const ps = periods[idx] || periods[periods.length - 1] || periodSchedule(c, 0);
-    setModal({ type: "payment", payload: { contract: c, initial: p, suggestion: { index: idx, label: ps.label, due: ps.due, amount: ps.amount, prorated: ps.prorated, days: ps.days, existingReceived, periods } } });
-  }
-
-  function Properties() {
-    const list = properties.filter((p) => !search || p.name.includes(search) || (p.location || "").includes(search));
-    return (
-      <div className="space-y-3">
-        <div className="flex justify-between items-center">
-          <h2 className="font-extrabold text-stone-800 text-lg">العقارات</h2>
-          <Btn onClick={() => setModal({ type: "property" })}>+ عقار</Btn>
-        </div>
-        {list.length === 0 ? <Empty icon="🏢" text="لا توجد عقارات بعد" action={<Btn onClick={() => setModal({ type: "property" })}>إضافة أول عقار</Btn>} /> :
-          list.map((p) => <PropertyCard key={p.id} p={p} />)}
-      </div>
-    );
-  }
-  function PropertyCard({ p }) {
-    const [open, setOpen] = useState(false);
-    const cs = active.filter((c) => c.propertyId === p.id);
-    const ended = contracts.filter((c) => c.propertyId === p.id && c.status === "ended");
-    return (
-      <div className="bg-white rounded-2xl border border-stone-100 shadow-sm overflow-hidden">
-        <div className="p-4 flex items-center justify-between cursor-pointer" onClick={() => setOpen(!open)}>
-          <div>
-            <div className="font-bold text-stone-800">{p.name}</div>
-            <div className="text-xs text-stone-500">{p.type}{p.location ? ` · ${p.location}` : ""} · {(p.units || []).length} وحدة · {cs.length} مؤجّر</div>
-          </div>
-          <span className="text-stone-400">{open ? "▲" : "▼"}</span>
-        </div>
-        {open && (
-          <div className="border-t border-stone-100 p-4 space-y-3">
-            <div className="flex flex-wrap gap-2">
-              <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "unit", payload: { propId: p.id, propName: p.name } })}>+ وحدة</Btn>
-              <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "contract", payload: { presetProperty: p.id } })}>+ عقد إيجار</Btn>
-              <Btn kind="gold" className="px-3 py-2" onClick={() => setModal({ type: "placeStatement", payload: { propertyId: p.id, unitId: null, title: `كشف العقار — ${p.name}` } })}>كشف العقار</Btn>
-              <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "property", payload: p })}>تعديل</Btn>
-              <Btn kind="danger" className="px-3 py-2" onClick={() => askConfirm("حذف العقار؟ لن تُحذف العقود تلقائياً.", () => delProperty(p.id))}>حذف</Btn>
-            </div>
-            {(p.units || []).length > 0 && (
-              <div>
-                <div className="text-xs font-bold text-stone-500 mb-1">الوحدات</div>
-                <div className="space-y-1.5">
-                  {(p.units || []).map((u) => {
-                    const occ = active.find((c) => c.unitId === u.id);
-                    return (
-                      <div key={u.id} className="bg-stone-50 rounded-xl px-3 py-2 text-sm">
-                        <div className="flex items-center justify-between">
-                          <div className="min-w-0">
-                            <span className="font-bold">{u.name}</span>{u.desc ? <span className="text-stone-400"> · {u.desc}</span> : ""}
-                            {occ && <span className="text-teal-700"> · {tenantName(occ.tenantId)}</span>}
-                          </div>
-                          {occ ? <Pill className="bg-teal-100 text-teal-700">مؤجّر</Pill> : <Pill className="bg-stone-200 text-stone-600">شاغر</Pill>}
-                        </div>
-                        <div className="flex items-center gap-4 mt-1 text-xs">
-                          <button className="text-teal-700 font-bold" onClick={() => setModal({ type: "placeStatement", payload: { propertyId: p.id, unitId: u.id, title: `كشف ${u.name} — ${p.name}` } })}>كشف</button>
-                          {!occ && <button className="text-teal-700 font-bold" onClick={() => setModal({ type: "contract", payload: { presetProperty: p.id, presetUnit: u.id } })}>تأجير</button>}
-                          <button className="text-stone-500" onClick={() => setModal({ type: "unit", payload: { propId: p.id, propName: p.name, unit: u } })}>تعديل</button>
-                          <button className="text-rose-400" onClick={() => askConfirm("حذف الوحدة؟", () => delUnit(p.id, u.id))}>حذف</button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            {cs.length > 0 && (
-              <div>
-                <div className="text-xs font-bold text-stone-500 mb-1">العقود النشطة</div>
-                {cs.map((c) => <ContractMini key={c.id} c={c} />)}
-              </div>
-            )}
-            {ended.length > 0 && (
-              <div className="text-xs text-stone-400">عقود سابقة محفوظة: {ended.length} — اطّلع عليها عبر «كشف العقار».</div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  }
-  function ContractMini({ c }) {
-    return (
-      <div className="flex items-center justify-between bg-teal-50 rounded-xl px-3 py-2 text-sm mb-1.5">
-        <div><span className="font-bold">{tenantName(c.tenantId)}</span><span className="text-stone-500"> · {fmt(c.amount)} {settings.currency}/{rentLabel(c.rentType)}</span></div>
-        <Btn onClick={() => openPayment(c)} className="px-3 py-1.5">دفعة</Btn>
-      </div>
-    );
-  }
-
-  function Tenants() {
-    const list = tenants.filter((t) => !search || t.name.includes(search) || tenantPhones(t.id).some((p) => p.includes(search)));
-    return (
-      <div className="space-y-3">
-        <div className="flex justify-between items-center">
-          <h2 className="font-extrabold text-stone-800 text-lg">المستأجرون</h2>
-          <Btn onClick={() => setModal({ type: "tenant" })}>+ مستأجر</Btn>
-        </div>
-        {list.length === 0 ? <Empty icon="👤" text="لا يوجد مستأجرون بعد" action={<Btn onClick={() => setModal({ type: "tenant" })}>إضافة مستأجر</Btn>} /> :
-          list.map((t) => <TenantCard key={t.id} t={t} />)}
-      </div>
-    );
-  }
-  function TenantCard({ t }) {
-    const [open, setOpen] = useState(false);
-    const s = statementFor(t.id);
-    return (
-      <div className="bg-white rounded-2xl border border-stone-100 shadow-sm overflow-hidden">
-        <div className="p-4 flex items-center justify-between cursor-pointer" onClick={() => setOpen(!open)}>
-          <div>
-            <div className="font-bold text-stone-800">{t.name}</div>
-            <div className="text-xs text-stone-500">{(tenantPhones(t.id).join("، ")) || "بدون رقم"} · رصيد {fmt(s.balance)} {settings.currency}</div>
-          </div>
-          <span className="text-stone-400">{open ? "▲" : "▼"}</span>
-        </div>
-        {open && (
-          <div className="border-t border-stone-100 p-4 space-y-2">
-            <div className="flex flex-wrap gap-2">
-              <Btn className="px-3 py-2" onClick={() => setModal({ type: "statement", payload: t.id })}>كشف الحساب (عرض / إرسال)</Btn>
-              <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "tenant", payload: t })}>تعديل</Btn>
-              <Btn kind="danger" className="px-3 py-2" onClick={() => askConfirm("حذف المستأجر؟", () => delTenant(t.id))}>حذف</Btn>
-            </div>
-            <div className="grid grid-cols-3 gap-2 text-center text-sm pt-1">
-              <div className="bg-stone-50 rounded-xl p-2"><div className="text-xs text-stone-500">مستحق</div><div className="font-bold">{fmt(s.charged)}</div></div>
-              <div className="bg-stone-50 rounded-xl p-2"><div className="text-xs text-stone-500">مسدّد</div><div className="font-bold text-emerald-600">{fmt(s.received)}</div></div>
-              <div className="bg-stone-50 rounded-xl p-2"><div className="text-xs text-stone-500">متبقٍ</div><div className="font-bold text-rose-600">{fmt(s.balance)}</div></div>
-            </div>
-            {s.contracts.length > 0 && <div className="text-xs text-stone-500 pt-1">العقود: {s.contracts.map((c) => placeName(c)).join("، ")}</div>}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  function Collection() {
-    const list = active.filter((c) => !search || tenantName(c.tenantId).includes(search) || placeName(c).includes(search));
-    return (
-      <div className="space-y-3">
-        <div className="flex justify-between items-center">
-          <h2 className="font-extrabold text-stone-800 text-lg">التحصيل والإيصالات</h2>
-          {properties.length > 0 && tenants.length > 0 && <Btn onClick={() => setModal({ type: "contract" })}>+ عقد</Btn>}
-        </div>
-        {active.length === 0 ? <Empty icon="🧾" text="لا توجد عقود نشطة. أنشئ عقداً لبدء التحصيل." action={properties.length && tenants.length ? <Btn onClick={() => setModal({ type: "contract" })}>عقد جديد</Btn> : <span className="text-sm text-stone-400">أضف عقاراً ومستأجراً أولاً</span>} /> :
-          list.map((c) => {
-            const due = nextDue(c); const late = due < todayISO();
-            const last = paymentsOf(c.id).slice(-1)[0];
-            const L = contractLedger(c);
-            return (
-              <div key={c.id} className="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="font-bold text-stone-800 truncate">{tenantName(c.tenantId)}</div>
-                    <div className="text-xs text-stone-500 truncate">{placeName(c)} · {fmt(c.amount)} {settings.currency}/{rentLabel(c.rentType)}</div>
-                    <div className="text-xs mt-1">
-                      الاستحقاق التالي: <span className={late ? "text-rose-600 font-bold" : "text-stone-600"}>{due}</span> {late && <Pill className="bg-rose-100 text-rose-700">متأخر</Pill>}
-                    </div>
-                    <div className="text-xs mt-1">
-                      {L.owed > 0.005
-                        ? <span className="text-rose-700 font-bold">الرصيد: عليه {fmt(L.owed)} {settings.currency}</span>
-                        : L.credit > 0.005
-                          ? <span className="text-sky-700 font-bold">الرصيد: له {fmt(L.credit)} {settings.currency}</span>
-                          : <span className="text-emerald-700 font-bold">الحساب مسوّى</span>}
-                    </div>
-                  </div>
-                  <Btn onClick={() => openPayment(c)} className="shrink-0">+ دفعة</Btn>
-                </div>
-                <div className="flex flex-wrap gap-2 mt-3">
-                  <WaButtons phones={tenantPhones(c.tenantId)} cc={settings.countryCode} text={reminderText(c)} label="تذكير سداد" />
-                  <Btn kind="gold" className="px-3 py-2" onClick={() => setModal({ type: "schedule", payload: c })}>جدول السداد</Btn>
-                  <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "contract-view", payload: c })}>إرسال العقد</Btn>
-                  {last && <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "receipt", payload: last })}>آخر إيصال ({last.receiptNo})</Btn>}
-                  <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "contract", payload: c })}>تعديل العقد</Btn>
-                  <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "renew", payload: c })}>تجديد / تمديد</Btn>
-                  <Btn kind="ghost" className="px-3 py-2" onClick={() => setModal({ type: "transfer", payload: c })}>نقل</Btn>
-                  <Btn kind="ghost" className="px-3 py-2" onClick={() => askConfirm("إنهاء العقد؟ يبقى السجل محفوظاً.", () => endContract(c.id))}>إنهاء</Btn>
-                </div>
-                {paymentsOf(c.id).length > 0 && (
-                  <details className="mt-3">
-                    <summary className="text-xs font-bold text-teal-700 cursor-pointer">سجل الإيصالات ({paymentsOf(c.id).length})</summary>
-                    <div className="mt-2 space-y-1.5">
-                      {paymentsOf(c.id).slice().reverse().map((p) => {
-                        const st = paymentStatus(p);
-                        return (
-                          <div key={p.id} className="flex items-center justify-between bg-stone-50 rounded-xl px-3 py-2 text-sm">
-                            <div className="min-w-0"><div className="font-bold truncate">{p.receiptNo} · {fmt(p.received)} {settings.currency}</div><div className="text-xs text-stone-400">{p.paymentDate}</div></div>
-                            <div className="flex items-center gap-2"><Pill className={st.color}>{st.label}</Pill><button onClick={() => setModal({ type: "receipt", payload: p })} className="text-teal-700 text-xs font-bold">عرض</button><button onClick={() => openEditPayment(p)} className="text-stone-500 text-xs font-bold">تعديل</button><button onClick={() => askConfirm("حذف هذا الإيصال؟", () => delPayment(p.id))} className="text-rose-400 text-xs font-bold">حذف</button></div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </details>
-                )}
-              </div>
-            );
-          })}
-      </div>
-    );
-  }
-
-  function More() {
-    const totalIncome = payments.reduce((s, p) => s + num(p.received), 0);
-    const totalExp = expenses.reduce((s, e) => s + num(e.amount), 0);
-    return (
-      <div className="space-y-3">
-        <h2 className="font-extrabold text-stone-800 text-lg">المزيد</h2>
-        <div className="grid grid-cols-2 gap-3">
-          <Stat label="إجمالي التحصيل" value={fmt(totalIncome)} sub={settings.currency} color="text-emerald-600" />
-          <Stat label="إجمالي المصاريف" value={fmt(totalExp)} sub={settings.currency} color="text-rose-600" />
-        </div>
-        <div className="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
-          <div className="flex justify-between items-center mb-2">
-            <h3 className="font-bold text-stone-800">المصاريف والصيانة</h3>
-            {properties.length > 0 && <Btn className="px-3 py-2" onClick={() => setModal({ type: "expense" })}>+ مصروف</Btn>}
-          </div>
-          <div className="text-sm font-bold text-teal-700 mb-2">صافي الدخل: {fmt(totalIncome - totalExp)} {settings.currency}</div>
-          {expenses.length === 0 ? <p className="text-sm text-stone-400">لا توجد مصاريف مسجّلة.</p> :
-            <div className="space-y-1.5">
-              {expenses.slice().reverse().map((e) => (
-                <div key={e.id} className="flex items-center justify-between bg-stone-50 rounded-xl px-3 py-2 text-sm">
-                  <div><span className="font-bold">{e.cat}</span> · {fmt(e.amount)} {settings.currency}<span className="text-stone-400"> · {propertyById(e.propertyId)?.name || "عام"} · {e.date}</span></div>
-                  <button onClick={() => askConfirm("حذف المصروف؟", () => delExpense(e.id))} className="text-rose-400 text-xs">حذف</button>
-                </div>
-              ))}
-            </div>}
-        </div>
-
-        <MenuRow icon="📄" label={`أرشيف العقود (${contracts.length})`} onClick={() => setModal({ type: "archive" })} />
-        <MenuRow icon="⚙️" label="الإعدادات (العملة، رمز الدولة، الشعار)" onClick={() => setModal({ type: "settings" })} />
-        <MenuRow icon="🔔" label={settings.notify ? "تنبيهات المتأخرات مفعّلة ✓" : "تفعيل تنبيهات المتأخرات"} onClick={enableNotifications} />
-        {autoBackup.linked ? (
-          <>
-            <MenuRow icon={autoBackup.ok ? "💾" : "⚠️"} label={autoBackup.ok ? `النسخ التلقائي مفعّل ✓ (${autoBackup.name})` : "النسخ التلقائي يحتاج إعادة ربط"} onClick={saveBackupNow} />
-            <MenuRow icon="🔓" label="إلغاء ربط النسخ التلقائي" onClick={() => askConfirm("إلغاء ربط ملف النسخ الاحتياطي التلقائي؟", unlinkAutoBackup)} />
-          </>
-        ) : (
-          <MenuRow icon="💾" label="تفعيل النسخ الاحتياطي التلقائي في ملف" onClick={linkAutoBackup} />
-        )}
-        <MenuRow icon="⬇️" label="تصدير نسخة احتياطية (JSON)" onClick={exportBackup} />
-        <MenuRow icon="⬆️" label="استيراد نسخة احتياطية" onClick={() => importRef.current?.click()} />
-        <input ref={importRef} type="file" accept="application/json" className="hidden" onChange={importBackup} />
-        <MenuRow icon="🗑️" label="مسح كل البيانات" danger onClick={() => askConfirm("سيتم حذف جميع البيانات نهائياً. متأكد؟", () => setData(defaultData()))} />
-        <p className="text-center text-xs text-stone-300 pt-2">{autoBackup.linked ? "تُحفظ نسخة تلقائياً في الملف المرتبط عند كل تعديل." : "بياناتك محفوظة تلقائياً على هذا الجهاز."}</p>
-      </div>
-    );
-  }
-  function MenuRow({ icon, label, onClick, danger }) {
-    return (
-      <button onClick={onClick} className={`w-full bg-white rounded-2xl border border-stone-100 shadow-sm p-4 flex items-center gap-3 text-right ${danger ? "text-rose-600" : "text-stone-700"}`}>
-        <span className="text-xl">{icon}</span><span className="font-bold flex-1">{label}</span><span className="text-stone-300">‹</span>
-      </button>
-    );
-  }
-
-  function enableNotifications() {
-    try {
-      if (typeof Notification === "undefined") { showToast("التنبيهات غير مدعومة في هذه البيئة"); return; }
-      Notification.requestPermission().then((perm) => {
-        if (perm === "granted") { update((d) => { d.settings.notify = true; }); showToast("تم تفعيل التنبيهات"); }
-        else showToast("لم يتم منح إذن التنبيهات");
-      }).catch(() => showToast("التنبيهات غير متاحة هنا"));
-    } catch (e) { showToast("التنبيهات غير متاحة هنا"); }
-  }
-  function exportBackup() {
-    try {
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a"); a.href = url; a.download = `عقارات-${todayISO()}.json`; a.click();
-      URL.revokeObjectURL(url); showToast("تم التصدير");
-    } catch (e) { showToast("تعذّر التصدير"); }
-  }
-  async function linkAutoBackup() {
-    if (!fsSupported()) { showToast("المتصفح لا يدعم الحفظ التلقائي في ملف — استخدم التصدير اليدوي"); return; }
-    try {
-      const handle = await fsPickBackupFile();
-      backupHandleRef.current = handle;
-      const ok = await fsWriteBackup(handle, data);
-      setAutoBackup({ linked: true, name: handle.name || "ملف النسخ الاحتياطي", ok });
-      showToast(ok ? "تم الربط — ستُحفظ نسخة تلقائياً عند كل تعديل" : "تم الربط لكن تعذّرت الكتابة");
-    } catch (e) { if (e && e.name !== "AbortError") showToast("تعذّر الربط"); }
-  }
-  async function saveBackupNow() {
-    if (!backupHandleRef.current) { showToast("لا يوجد ملف مرتبط"); return; }
-    try { const ok = await fsWriteBackup(backupHandleRef.current, data); setAutoBackup((s) => ({ ...s, ok })); showToast(ok ? "تم حفظ النسخة الآن" : "تعذّرت الكتابة — أعد الربط"); }
-    catch (e) { showToast("تعذّرت الكتابة — أعد الربط"); }
-  }
-  async function unlinkAutoBackup() {
-    backupHandleRef.current = null; await idbDel(FS_KEY); setAutoBackup({ linked: false, name: "", ok: true }); showToast("تم إلغاء الربط");
-  }
-  function importBackup(ev) {
-    const f = ev.target.files?.[0]; if (!f) return;
-    const r = new FileReader();
-    r.onload = () => { try { const d = JSON.parse(r.result); setData({ ...defaultData(), ...d }); showToast("تم الاستيراد"); } catch (e) { showToast("ملف غير صالح"); } };
-    r.readAsText(f); ev.target.value = "";
-  }
-
-  /* ----- تبويب سفلي ----- */
-  const tabs = [
-    { id: "home", label: "الرئيسية", icon: "🏠" },
-    { id: "properties", label: "العقارات", icon: "🏢" },
-    { id: "collection", label: "التحصيل", icon: "🧾" },
-    { id: "tenants", label: "المستأجرون", icon: "👤" },
-    { id: "more", label: "المزيد", icon: "⋯" },
-  ];
-  const showSearch = ["properties", "tenants", "collection"].includes(tab);
-
-  return (
-    <div className="pm-root min-h-screen bg-stone-50" dir="rtl">
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&family=Amiri:wght@700&display=swap');
-        .pm-root, .pm-root * { font-family: 'Cairo','Segoe UI',Tahoma,sans-serif; }
-        .pm-root .font-amiri { font-family: 'Amiri','Cairo',serif; }
-        .pm-root details summary{ list-style:none; } .pm-root details summary::-webkit-details-marker{ display:none; }
-        @media print {
-          body * { visibility: hidden !important; }
-          #print-area, #print-area * { visibility: visible !important; }
-          #print-area { position: absolute; inset: 0; margin: 0; }
-          .no-print { display: none !important; }
-        }
-      `}</style>
-
-      {/* الترويسة */}
-      <header className="bg-teal-800 text-white sticky top-0 z-30 shadow-md border-b-2 border-amber-400">
-        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-amber-400 text-teal-900 flex items-center justify-center font-amiri text-xl font-bold shrink-0">ع</div>
-            <div>
-              <div className="font-extrabold text-lg leading-tight">إدارة العقارات</div>
-              <div className="text-teal-200 text-xs">{settings.org || "إيجارات وإيصالات"}</div>
-            </div>
-          </div>
-          <div className="text-teal-200 text-xs">{todayISO()}</div>
-        </div>
-        {showSearch && (
-          <div className="max-w-2xl mx-auto px-4 pb-3">
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="بحث…" className="w-full rounded-xl px-3 py-2 text-stone-800 text-sm focus:outline-none" />
-          </div>
-        )}
-      </header>
-
-      <main className="max-w-2xl mx-auto px-4 py-4 pb-28">
-        {tab === "home" && <Home />}
-        {tab === "properties" && <Properties />}
-        {tab === "collection" && <Collection />}
-        {tab === "tenants" && <Tenants />}
-        {tab === "more" && <More />}
-      </main>
-
-      {/* تبويب سفلي */}
-      <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-stone-200 z-30 shadow-lg">
-        <div className="max-w-2xl mx-auto grid grid-cols-5">
-          {tabs.map((t) => {
-            const on = tab === t.id;
-            return (
-              <button key={t.id} onClick={() => { setTab(t.id); setSearch(""); }} className="relative py-2.5 flex flex-col items-center gap-0.5">
-                {on && <span className="absolute top-0 h-0.5 w-8 rounded-full bg-amber-400"></span>}
-                <span className={`text-lg ${on ? "" : "opacity-60"}`}>{t.icon}</span>
-                <span className={`text-xs font-bold ${on ? "text-teal-800" : "text-stone-400"}`}>{t.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      </nav>
-
-      {/* النماذج */}
-      {modal?.type === "property" && <PropertyForm initial={modal.payload} onClose={() => setModal(null)} onSave={(p) => { saveProperty(p); setModal(null); }} />}
-      {modal?.type === "unit" && <UnitForm propertyName={modal.payload.propName} initial={modal.payload.unit} onClose={() => setModal(null)} onSave={(u) => { saveUnit(modal.payload.propId, u); setModal(null); }} />}
-      {modal?.type === "tenant" && <TenantForm initial={modal.payload} defaultCC={settings.countryCode} onClose={() => setModal(null)} onSave={(t) => { saveTenant(t); setModal(null); }} />}
-      {modal?.type === "contract" && <ContractForm initial={modal.payload?.id ? modal.payload : null} preset={modal.payload?.id ? null : modal.payload} properties={properties} tenants={tenants} contracts={contracts} onAddTenant={() => setModal({ type: "tenant" })} onClose={() => setModal(null)} onSave={handleSaveContract} />}
-      {modal?.type === "payment" && <PaymentForm contract={modal.payload.contract} suggestion={modal.payload.suggestion} initial={modal.payload.initial} ctx={{ ...ctx, tenantName, placeName }} onClose={() => setModal(null)} onSave={(p) => savePayment(p)} />}
-      {modal?.type === "receipt" && <ReceiptView payment={modal.payload} ctx={{ ...ctx, tenantName, placeName, contractById, tenantPhone, tenantPhones, contractLedger, toast: showToast }} onEdit={() => openEditPayment(modal.payload)} onClose={() => setModal(null)} />}
-      {modal?.type === "statement" && <StatementView data={statementStruct(modal.payload)} text={statementText(modal.payload)} phones={tenantPhones(modal.payload)} ctx={{ settings, copy, toast: showToast }} onClose={() => setModal(null)} />}
-      {modal?.type === "placeStatement" && <PlaceStatementView title={modal.payload.title} stmt={statementForPlace(modal.payload.propertyId, modal.payload.unitId)} text={placeStatementText(modal.payload.propertyId, modal.payload.unitId, modal.payload.title)} currency={settings.currency} logo={settings.logo} onCopy={copy} onClose={() => setModal(null)} />}
-      {modal?.type === "transfer" && <TransferForm contract={modal.payload} properties={properties} contracts={contracts} tenantName={tenantName} placeName={placeName} currency={settings.currency} onClose={() => setModal(null)} onSave={(payload) => handleTransfer(modal.payload, payload)} />}
-      {modal?.type === "expiry-action" && <ExpiryActionModal contract={modal.payload} ctx={{ settings, tenantName, placeName, tenantPhones, copy, expiryMsgVacate, expiryMsgReprice, expiryMsgNotes }} onClose={() => setModal(null)} onRenew={() => setModal({ type: "renew", payload: modal.payload })} />}
-      {modal?.type === "archive" && (() => {
-        const cur = settings.currency;
-        const list = contracts.slice().sort((a, b) => ((a.startDate || "") < (b.startDate || "") ? 1 : -1));
-        return (
-          <Modal title={`أرشيف العقود (${list.length})`} onClose={() => setModal(null)} wide>
-            {list.length === 0 ? <p className="text-sm text-stone-400">لا توجد عقود بعد.</p> : (
-              <div className="space-y-2">
-                {list.map((c) => {
-                  const L = contractLedger(c);
-                  return (
-                    <div key={c.id} className="border border-stone-200 rounded-2xl p-3">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="font-bold text-stone-800 truncate">{c.contractNo || "—"} · {tenantName(c.tenantId)}</div>
-                          <div className="text-xs text-stone-500 truncate">{placeName(c)} · {fmt(c.amount)} {cur}/{rentLabel(c.rentType)}</div>
-                          <div className="text-xs text-stone-400">من {c.startDate || "—"}{c.endDate ? ` إلى ${c.endDate}` : ""}</div>
-                        </div>
-                        <Pill className={c.status === "active" ? "bg-teal-100 text-teal-700" : "bg-stone-200 text-stone-600"}>{c.status === "active" ? "نشط" : "منتهٍ"}</Pill>
-                      </div>
-                      <div className="text-xs mt-1">{L.owed > 0.005 ? <span className="text-rose-700 font-bold">عليه {fmt(L.owed)} {cur}</span> : L.credit > 0.005 ? <span className="text-sky-700 font-bold">له {fmt(L.credit)} {cur}</span> : <span className="text-emerald-700 font-bold">مسوّى</span>}</div>
-                      <div className="flex flex-wrap gap-2 mt-2">
-                        <Btn kind="ghost" className="px-3 py-1.5 text-sm" onClick={() => setModal({ type: "contract-view", payload: c })}>عرض / إرسال العقد</Btn>
-                        <Btn kind="gold" className="px-3 py-1.5 text-sm" onClick={() => setModal({ type: "schedule", payload: c })}>جدول السداد</Btn>
-                        {c.status === "ended" && (!c.endDate || c.endDate >= todayISO()) && <Btn className="px-3 py-1.5 text-sm" onClick={() => askConfirm("استعادة هذا العقد وجعله نشطاً؟", () => restoreContract(c.id))}>استعادة</Btn>}
-                        <Btn kind="ghost" className="px-3 py-1.5 text-sm text-rose-600" onClick={() => askConfirm(`حذف العقد ${c.contractNo || ""} وكل مدفوعاته نهائياً؟`, () => deleteContract(c.id))}>حذف</Btn>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </Modal>
-        );
-      })()}
-      {modal?.type === "renew" && <RenewForm contract={modal.payload} tenantName={tenantName} placeName={placeName} currency={settings.currency} onClose={() => setModal(null)} onSave={(nd) => handleRenew(modal.payload, nd)} />}
-      {modal?.type === "contract-view" && <ContractView contract={modal.payload} ctx={{ ...ctx, tenantName, placeName, tenantPhones, contractText, copy, toast: showToast }} onClose={() => setModal(null)} />}
-      {modal?.type === "renewal" && (() => {
-        const c = modal.payload.c; const text = renewalText(c, modal.payload.old, modal.payload.carried);
-        return (
-          <Modal title="إشعار تجديد/تمديد العقد" onClose={() => setModal(null)}>
-            <div className="bg-teal-50 text-teal-800 rounded-xl p-3 text-sm mb-3">تم حفظ العقد. يمكنك إرسال إشعار للمستأجر «{tenantName(c.tenantId)}» بالتجديد/التمديد.</div>
-            <div className="bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm whitespace-pre-wrap mb-3">{text}</div>
-            <div className="flex flex-wrap gap-2">
-              <WaButtons phones={tenantPhones(c.tenantId)} cc={settings.countryCode} text={text} label="إرسال عبر واتساب" />
-              <Btn kind="ghost" onClick={() => copy(text)}>نسخ النص</Btn>
-              <Btn kind="ghost" onClick={() => setModal(null)}>لاحقاً</Btn>
-            </div>
-          </Modal>
-        );
-      })()}
-      {modal?.type === "schedule" && (() => {
-        const c = modal.payload; const rows = periodAllocation(c); const cur = settings.currency;
-        const stColor = { paid: "bg-emerald-100 text-emerald-700", partial: "bg-amber-100 text-amber-700", unpaid: "bg-rose-100 text-rose-700" };
-        const stLabel = { paid: "مسدّد", partial: "جزئي", unpaid: "غير مسدّد" };
-        return (
-          <Modal title={`جدول السداد — ${tenantName(c.tenantId)}`} onClose={() => setModal(null)} wide>
-            <div className="bg-teal-50 text-teal-800 rounded-xl p-3 text-sm mb-3">{placeName(c)} · عقد {c.contractNo || "—"} · الفترات مرتّبة من الأقدم، ويُسوّى الأقدم أولاً.</div>
-            <div className="space-y-1.5">
-              {rows.map((r) => {
-                const isOther = r.contractNo && r.contractNo !== c.contractNo;
-                return (
-                  <div key={r.index} className={`flex items-center justify-between rounded-xl px-3 py-2 text-sm gap-2 ${r.status === "unpaid" ? "bg-rose-50" : "bg-stone-50"}`}>
-                    <div className="min-w-0">
-                      <div className="font-bold truncate">{r.label}</div>
-                      <div className="text-xs text-stone-400">
-                        {fmt(r.amount)} {cur}
-                        {isOther && <span className="text-rose-600"> · من عقد {r.contractNo}</span>}
-                        {r.status === "partial" && <span className="text-amber-600"> · سُدّد {fmt(r.paidAmt)}</span>}
-                        {r.receipts.length > 0 && <span> · {r.receipts.join("، ")}</span>}
-                      </div>
-                    </div>
-                    <Pill className={stColor[r.status]}>{stLabel[r.status]}</Pill>
-                  </div>
-                );
-              })}
-              {rows.length === 0 && <p className="text-sm text-stone-400">لا توجد فترات بعد.</p>}
-            </div>
-          </Modal>
-        );
-      })()}
-      {modal?.type === "expense" && <ExpenseForm properties={properties} currency={settings.currency} onClose={() => setModal(null)} onSave={(e) => { saveExpense(e); setModal(null); }} />}
-      {modal?.type === "settings" && <SettingsForm settings={settings} onClose={() => setModal(null)} onSave={(s) => { saveSettings(s); setModal(null); }} />}
-
-      {/* تأكيد */}
-      {confirmBox && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/50 p-4">
-          <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-5">
-            <p className="text-stone-700 font-bold mb-4">{confirmBox.message}</p>
-            <div className="flex gap-2">
-              <Btn kind="danger" className="flex-1" onClick={() => { confirmBox.onYes(); setConfirmBox(null); }}>نعم</Btn>
-              <Btn kind="ghost" className="flex-1" onClick={() => setConfirmBox(null)}>إلغاء</Btn>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* إشعار */}
-      {toast && <div className="fixed bottom-24 inset-x-0 flex justify-center z-50"><div className="bg-stone-800 text-white text-sm font-bold px-4 py-2 rounded-full shadow-lg">{toast}</div></div>}
-    </div>
-  );
-}
-
-function defaultData() {
-  return {
-    properties: [],
-    tenants: [],
-    contracts: [],
-    payments: [],
-    expenses: [],
-    counters: { receipt: 1, contract: 1 },
-    settings: { org: "", ownerPhone: "", currency: "د.ل", countryCode: "218", receiptPrefix: "REC-", expiryAlertDays: 30, logo: "", logoOnly: false, notify: false, contractTerms: "" },
-  };
-}
+      if (cs.needsRenewal || !cs.nextPeriod) {
+        // لا توجد فترة قادمة ضمن مدة العقد — العقد مكتمل السداد ويحتاج تجديداً
+        lines.push(`جميع المستحقات ضمن مدة العقد مسدّدة بالكامل. لا يوجد مبلغ مطلوب حالياً.`, `للاستمرار يلزم تجديد العقد.`, `نشكر لكم التزامكم.`);
+      } else {
+        const ps = c
